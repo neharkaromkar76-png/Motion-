@@ -10,6 +10,8 @@ enum class MotionType(val displayName: String) {
     TILT_DOWN("Tilt Down"),
     ROTATION("Rotation"),
     SPEED_RAMP("Speed Ramp"),
+    WHIP_PAN("Whip Pan"),
+    HOLD("Hold / Pause"),
     COMBINED("Dynamic Motion")
 }
 

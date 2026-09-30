@@ -1,16 +1,17 @@
 package com.example.engine.analysis
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.util.Base64
+import android.util.Log
 import com.example.BuildConfig
 import com.example.data.model.AiAnalysisResult
 import com.example.data.model.DetectedEvent
-import com.example.data.model.EasingType
-import com.example.data.model.Keyframe
 import com.example.data.model.MotionType
 import com.example.data.model.VideoMetadata
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -18,15 +19,27 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
+/**
+ * Service that analyzes the reference video using real Gemini multimodal video understanding
+ * fused with frame-by-frame computer vision optical flow.
+ */
 class AiAnalysisService(private val context: Context) {
 
+    companion object {
+        private const val TAG = "MotionMatchAI"
+        // Analysis Cache (Part 21): once analyzed, cache MotionTimeline by URI & duration
+        private val analysisCache = ConcurrentHashMap<String, AiAnalysisResult>()
+    }
+
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(45, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     suspend fun analyzeReferenceVideo(
@@ -34,341 +47,353 @@ class AiAnalysisService(private val context: Context) {
         customApiKey: String? = null,
         customBackendUrl: String? = null,
         forceDemoMode: Boolean = false,
+        forceReanalyze: Boolean = false,
         onProgress: (stage: String, percent: Float) -> Unit = { _, _ -> }
     ): AiAnalysisResult = withContext(Dispatchers.IO) {
-        val apiKey = customApiKey?.takeIf { it.isNotBlank() }
-            ?: (try { BuildConfig.GEMINI_API_KEY } catch (_: Exception) { "" }).takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+        val cacheKey = "${referenceMetadata.uri}_${referenceMetadata.durationMs}"
 
-        onProgress("Extracting temporal reference frames", 0.15f)
-        delay(300)
-
-        if (forceDemoMode || (apiKey.isNullOrBlank() && customBackendUrl.isNullOrBlank())) {
-            // High fidelity realistic demo analysis with transparent labeling
-            return@withContext generateDemoAnalysisResult(referenceMetadata, onProgress)
+        if (!forceReanalyze && analysisCache.containsKey(cacheKey)) {
+            val cached = analysisCache[cacheKey]!!
+            Log.d(TAG, "REFERENCE_ANALYSIS_COMPLETED (CACHED): samples=${cached.motionTimeline?.samples?.size}")
+            onProgress("Loaded cached reference motion timeline", 1.0f)
+            return@withContext cached
         }
 
-        onProgress("Transmitting sample telemetry to AI Engine", 0.40f)
+        Log.d(TAG, "REFERENCE_ANALYSIS_STARTED: duration=${referenceMetadata.durationMs}ms, fps=${referenceMetadata.fps}")
 
-        try {
-            if (!customBackendUrl.isNullOrBlank()) {
-                val result = callCustomBackend(customBackendUrl, referenceMetadata)
-                onProgress("Validating structured keyframe schema", 0.90f)
-                return@withContext result
-            }
+        onProgress("Decoding reference video frames", 0.10f)
 
-            if (!apiKey.isNullOrBlank()) {
-                val result = callGeminiApi(apiKey, referenceMetadata, onProgress)
-                return@withContext result
-            }
-
-            generateDemoAnalysisResult(referenceMetadata, onProgress)
+        val frames = try {
+            decodeReferenceFrames(referenceMetadata, onProgress)
         } catch (e: Exception) {
-            // Fallback gracefully on network failure with informative notes
-            val fallback = generateDemoAnalysisResult(referenceMetadata, onProgress)
-            fallback.copy(
-                notes = "Live AI request encountered network error (${e.message ?: "Connection error"}). Displaying DEMO ANALYSIS dataset."
+            Log.e(TAG, "Failed to decode reference video frames: ${e.message}", e)
+            emptyList()
+        }
+
+        if (frames.size < 2) {
+            Log.w(TAG, "Failed to extract sufficient frames from reference video (${frames.size} frames)")
+            return@withContext AiAnalysisResult(
+                isDemo = false,
+                referenceDurationSec = referenceMetadata.durationMs / 1000f,
+                detectedFps = referenceMetadata.fps,
+                motionStyle = "Unknown",
+                events = emptyList(),
+                rawKeyframes = emptyList(),
+                overallConfidence = 0.0f,
+                sceneCutsCount = 0,
+                notes = "Reference motion could not be reliably analyzed.",
+                isSuccess = false,
+                errorMessage = "Reference motion could not be reliably analyzed."
             )
+        }
+
+        Log.d(TAG, "FRAMES_ANALYZED: count=${frames.size}")
+
+        // Check for Gemini API key (via BuildConfig injected from Secrets panel or custom setting)
+        val apiKey = customApiKey?.takeIf { it.isNotBlank() }
+            ?: (try { BuildConfig.GEMINI_API_KEY } catch (_: Exception) { "" })
+                .takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+
+        var geminiEvents: List<DetectedEvent>? = null
+        var geminiStyle: String? = null
+
+        if (!forceDemoMode && !apiKey.isNullOrBlank()) {
+            onProgress("Analyzing cinematography semantics with Gemini 3.5 Flash", 0.35f)
+            try {
+                val geminiResponse = callGeminiVideoAnalysis(apiKey, frames, referenceMetadata)
+                geminiEvents = geminiResponse.first
+                geminiStyle = geminiResponse.second
+                Log.d(TAG, "GEMINI_ANALYSIS_SUCCESS: detected ${geminiEvents.size} semantic events")
+            } catch (e: Exception) {
+                Log.w(TAG, "Gemini API request note: ${e.message}; continuing with optical flow CV")
+            }
+        }
+
+        onProgress("Computing optical flow & tracking background camera vectors", 0.55f)
+
+        val cvResult = CameraMotionEstimator.analyzeFrames(
+            frames = frames,
+            durationMs = referenceMetadata.durationMs,
+            fps = referenceMetadata.fps
+        )
+
+        // Recycle frame bitmaps to conserve memory (Part 22)
+        for ((_, bmp) in frames) {
+            try {
+                if (!bmp.isRecycled) bmp.recycle()
+            } catch (_: Exception) {}
+        }
+
+        when (cvResult) {
+            is CameraMotionEstimator.MotionAnalysisResult.Success -> {
+                onProgress("Synthesizing normalized reference motion curves", 0.85f)
+                val timeline = cvResult.timeline
+
+                // Fuse Gemini semantic events with CV events if available
+                val fusedEvents = if (!geminiEvents.isNullOrEmpty()) {
+                    (cvResult.events + geminiEvents).distinctBy { it.startTimeMs to it.type }
+                } else {
+                    cvResult.events
+                }
+
+                val finalStyle = geminiStyle ?: cvResult.motionStyle
+                val confidence = timeline.analysisConfidence
+
+                Log.d(TAG, "MOTION_SAMPLES: count=${timeline.samples.size}")
+                Log.d(TAG, "MOTION_EVENTS: count=${fusedEvents.size}")
+                Log.d(TAG, "AVERAGE_CONFIDENCE: $confidence")
+                Log.d(TAG, "REFERENCE_ANALYSIS_COMPLETED: style=$finalStyle")
+
+                val notes = "Optical flow analysis successful: ${timeline.samples.size} temporal samples, ${cvResult.keyframes.size} adaptive keyframes, ${fusedEvents.size} motion events detected."
+
+                val finalResult = AiAnalysisResult(
+                    isDemo = false,
+                    referenceDurationSec = referenceMetadata.durationMs / 1000f,
+                    detectedFps = referenceMetadata.fps,
+                    motionStyle = finalStyle,
+                    events = fusedEvents,
+                    rawKeyframes = cvResult.keyframes,
+                    overallConfidence = confidence,
+                    sceneCutsCount = cvResult.sceneCutsCount,
+                    notes = notes,
+                    motionTimeline = timeline,
+                    avgMotion = timeline.avgMotion,
+                    maxZoom = timeline.maxZoom,
+                    maxX = timeline.maxX,
+                    maxY = timeline.maxY,
+                    maxRotation = timeline.maxRotation,
+                    isSuccess = true
+                )
+
+                // Cache the authoritative timeline (Part 21)
+                analysisCache[cacheKey] = finalResult
+                onProgress("Analysis complete", 1.0f)
+                finalResult
+            }
+
+            is CameraMotionEstimator.MotionAnalysisResult.InsufficientMotion -> {
+                Log.w(TAG, "Insufficient camera motion: ${cvResult.reason}")
+                AiAnalysisResult(
+                    isDemo = false,
+                    referenceDurationSec = referenceMetadata.durationMs / 1000f,
+                    detectedFps = referenceMetadata.fps,
+                    motionStyle = "Static / Insufficient Motion",
+                    events = emptyList(),
+                    rawKeyframes = emptyList(),
+                    overallConfidence = 0.2f,
+                    sceneCutsCount = 0,
+                    notes = cvResult.reason,
+                    isSuccess = false,
+                    errorMessage = "Insufficient camera motion detected in the reference video."
+                )
+            }
+
+            is CameraMotionEstimator.MotionAnalysisResult.Failure -> {
+                Log.e(TAG, "Motion analysis failed: ${cvResult.error}")
+                AiAnalysisResult(
+                    isDemo = false,
+                    referenceDurationSec = referenceMetadata.durationMs / 1000f,
+                    detectedFps = referenceMetadata.fps,
+                    motionStyle = "Analysis Failed",
+                    events = emptyList(),
+                    rawKeyframes = emptyList(),
+                    overallConfidence = 0.0f,
+                    sceneCutsCount = 0,
+                    notes = cvResult.error,
+                    isSuccess = false,
+                    errorMessage = "Camera motion could not be reliably detected."
+                )
+            }
         }
     }
 
-    private suspend fun callGeminiApi(
+    /**
+     * Calls Gemini 3.5 Flash with sequential sampled frames to extract semantic camera kinematics
+     */
+    private suspend fun callGeminiVideoAnalysis(
         apiKey: String,
-        metadata: VideoMetadata,
-        onProgress: (String, Float) -> Unit
-    ): AiAnalysisResult {
-        onProgress("Analyzing motion dynamics with Gemini AI", 0.65f)
+        frames: List<Pair<Long, Bitmap>>,
+        metadata: VideoMetadata
+    ): Pair<List<DetectedEvent>, String> = withContext(Dispatchers.IO) {
+        val sampleStride = maxOf(1, frames.size / 6)
+        val selectedFrames = frames.filterIndexed { index, _ -> index % sampleStride == 0 }.take(6)
+
+        val partsArray = JSONArray()
 
         val prompt = """
-            Analyze the following video motion characteristics:
-            - Duration: ${metadata.durationMs / 1000f} seconds
-            - Resolution: ${metadata.width}x${metadata.height}
-            - FPS: ${metadata.fps}
-            
-            Extract camera movement, zoom-ins, zoom-outs, pans, tilts, rotations, speed ramps, and scene cuts.
-            Return STRICT JSON with this exact structure:
+            You are an expert video cinematography and camera motion analysis AI.
+            Analyze the camera kinematics across these sequential reference video frames.
+            Duration: ${metadata.durationMs / 1000f}s. FPS: ${metadata.fps}.
+            Extract:
+            1. Camera movement types (zoom_in, zoom_out, pan_left, pan_right, tilt_up, tilt_down, whip_pan, hold, rotation)
+            2. Exact start and end times in seconds
+            3. Intensity (0.0 to 1.0)
+            4. Confidence (0.0 to 1.0)
+            5. Dominant motion style summary
+
+            Respond strictly with valid JSON only in this exact format:
             {
-              "motionStyle": "Cinematic Dynamic Push",
-              "confidence": 0.94,
-              "sceneCutsCount": 2,
+              "motionStyle": "Dynamic Push-In & Tracking Pan",
               "events": [
-                {"startTime": 0.0, "endTime": 1.5, "type": "zoom_in", "confidence": 0.95, "description": "Quick punch in on subject"},
-                {"startTime": 1.5, "endTime": 3.0, "type": "pan_right", "confidence": 0.88, "description": "Smooth tracking pan"}
-              ],
-              "keyframes": [
-                {"time": 0.0, "x": 0.5, "y": 0.5, "scale": 1.0, "rotation": 0.0, "easing": "SMOOTH", "motion": "NONE"},
-                {"time": 1.5, "x": 0.48, "y": 0.46, "scale": 1.35, "rotation": -1.5, "easing": "EASE_OUT", "motion": "ZOOM_IN"},
-                {"time": 3.0, "x": 0.58, "y": 0.50, "scale": 1.25, "rotation": 0.0, "easing": "EASE_IN_OUT", "motion": "PAN_RIGHT"}
+                {
+                  "start": 0.0,
+                  "end": 1.2,
+                  "type": "zoom_in",
+                  "intensity": 0.42,
+                  "confidence": 0.92,
+                  "description": "Slow push in on subject"
+                }
               ]
             }
         """.trimIndent()
 
-        val jsonPayload = JSONObject().apply {
-            put("contents", JSONArray().put(JSONObject().apply {
-                put("parts", JSONArray().put(JSONObject().apply {
-                    put("text", prompt)
-                }))
-            }))
-            put("generationConfig", JSONObject().apply {
-                put("responseMimeType", "application/json")
-                put("temperature", 0.2)
-            })
+        partsArray.put(JSONObject().put("text", prompt))
+
+        // Attach sampled frame images as Base64 JPEG inlineData
+        for ((_, bmp) in selectedFrames) {
+            val stream = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 70, stream)
+            val base64 = Base64.encodeToString(stream.toByteArray(), Base64.NO_WRAP)
+            partsArray.put(
+                JSONObject().put(
+                    "inlineData",
+                    JSONObject()
+                        .put("mimeType", "image/jpeg")
+                        .put("data", base64)
+                )
+            )
         }
 
-        val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey")
-            .post(jsonPayload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
-
-        httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw Exception("Gemini API error code: ${response.code}")
-            }
-            val responseBody = response.body?.string() ?: throw Exception("Empty response from AI")
-            val root = JSONObject(responseBody)
-            val text = root.getJSONArray("candidates")
-                .getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts")
-                .getJSONObject(0)
-                .getString("text")
-
-            return parseAiJson(JSONObject(text), metadata, isDemo = false)
+        val requestBodyJson = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().put("parts", partsArray)))
+            put(
+                "generationConfig",
+                JSONObject().apply {
+                    put("responseMimeType", "application/json")
+                    put("temperature", 0.2)
+                }
+            )
         }
-    }
 
-    private fun callCustomBackend(url: String, metadata: VideoMetadata): AiAnalysisResult {
-        val payload = JSONObject().apply {
-            put("durationMs", metadata.durationMs)
-            put("width", metadata.width)
-            put("height", metadata.height)
-            put("fps", metadata.fps)
-        }
+        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
         val request = Request.Builder()
             .url(url)
-            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .post(requestBodyJson.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        httpClient.newCall(request).execute().use { response ->
-            val body = response.body?.string() ?: throw Exception("Empty backend response")
-            return parseAiJson(JSONObject(body), metadata, isDemo = false)
+        val response = httpClient.newCall(request).execute()
+        if (!response.isSuccessful) {
+            throw Exception("Gemini API error HTTP ${response.code}")
         }
-    }
 
-    private fun parseAiJson(json: JSONObject, metadata: VideoMetadata, isDemo: Boolean): AiAnalysisResult {
-        val motionStyle = json.optString("motionStyle", "Dynamic Motion")
-        val overallConfidence = json.optDouble("confidence", 0.92).toFloat()
-        val sceneCuts = json.optInt("sceneCutsCount", 1)
+        val responseBody = response.body?.string() ?: throw Exception("Empty Gemini response")
+        val json = JSONObject(responseBody)
+        val candidate = json.optJSONArray("candidates")?.optJSONObject(0)
+        val text = candidate?.optJSONObject("content")?.optJSONArray("parts")?.optJSONObject(0)?.optString("text") ?: ""
+
+        val structured = JSONObject(text)
+        val motionStyle = structured.optString("motionStyle", "Cinematic Camera Motion")
+        val eventsJson = structured.optJSONArray("events") ?: JSONArray()
 
         val eventsList = mutableListOf<DetectedEvent>()
-        val eventsArray = json.optJSONArray("events")
-        if (eventsArray != null) {
-            for (i in 0 until eventsArray.length()) {
-                val ev = eventsArray.getJSONObject(i)
-                val sTime = (ev.optDouble("startTime", 0.0) * 1000).toLong()
-                val eTime = (ev.optDouble("endTime", sTime / 1000.0 + 1.0) * 1000).toLong()
-                val typeStr = ev.optString("type", "NONE").uppercase()
-                val motionType = when {
-                    typeStr.contains("ZOOM_IN") -> MotionType.ZOOM_IN
-                    typeStr.contains("ZOOM_OUT") -> MotionType.ZOOM_OUT
-                    typeStr.contains("PAN_LEFT") -> MotionType.PAN_LEFT
-                    typeStr.contains("PAN_RIGHT") -> MotionType.PAN_RIGHT
-                    typeStr.contains("TILT_UP") -> MotionType.TILT_UP
-                    typeStr.contains("TILT_DOWN") -> MotionType.TILT_DOWN
-                    typeStr.contains("ROTATION") -> MotionType.ROTATION
-                    typeStr.contains("SPEED") -> MotionType.SPEED_RAMP
-                    else -> MotionType.COMBINED
-                }
-                eventsList.add(
-                    DetectedEvent(
-                        id = UUID.randomUUID().toString(),
-                        startTimeMs = sTime,
-                        endTimeMs = eTime,
-                        type = motionType,
-                        confidence = ev.optDouble("confidence", 0.9).toFloat(),
-                        description = ev.optString("description", "Motion section $i"),
-                        intensity = 1.0f
-                    )
-                )
+        for (i in 0 until eventsJson.length()) {
+            val ev = eventsJson.getJSONObject(i)
+            val startMs = (ev.optDouble("start", 0.0) * 1000).toLong()
+            val endMs = (ev.optDouble("end", 1.0) * 1000).toLong()
+            val typeStr = ev.optString("type", "NONE").uppercase()
+            val mType = when {
+                typeStr.contains("ZOOM_IN") -> MotionType.ZOOM_IN
+                typeStr.contains("ZOOM_OUT") -> MotionType.ZOOM_OUT
+                typeStr.contains("PAN_LEFT") -> MotionType.PAN_LEFT
+                typeStr.contains("PAN_RIGHT") -> MotionType.PAN_RIGHT
+                typeStr.contains("TILT_UP") -> MotionType.TILT_UP
+                typeStr.contains("TILT_DOWN") -> MotionType.TILT_DOWN
+                typeStr.contains("WHIP") -> MotionType.WHIP_PAN
+                typeStr.contains("HOLD") -> MotionType.HOLD
+                typeStr.contains("ROT") -> MotionType.ROTATION
+                else -> MotionType.COMBINED
             }
-        }
 
-        val keyframesList = mutableListOf<Keyframe>()
-        val kfArray = json.optJSONArray("keyframes")
-        if (kfArray != null) {
-            for (i in 0 until kfArray.length()) {
-                val kf = kfArray.getJSONObject(i)
-                val tMs = (kf.optDouble("time", 0.0) * 1000).toLong()
-                val x = kf.optDouble("x", 0.5).toFloat().coerceIn(0.05f, 0.95f)
-                val y = kf.optDouble("y", 0.5).toFloat().coerceIn(0.05f, 0.95f)
-                val scale = kf.optDouble("scale", 1.0).toFloat().coerceIn(0.8f, 3.0f)
-                val rot = kf.optDouble("rotation", 0.0).toFloat().coerceIn(-45f, 45f)
-                val easingStr = kf.optString("easing", "SMOOTH").uppercase()
-                val easing = when {
-                    easingStr.contains("EASE_IN_OUT") -> EasingType.EASE_IN_OUT
-                    easingStr.contains("EASE_IN") -> EasingType.EASE_IN
-                    easingStr.contains("EASE_OUT") -> EasingType.EASE_OUT
-                    easingStr.contains("CUBIC") -> EasingType.CUBIC
-                    easingStr.contains("LINEAR") -> EasingType.LINEAR
-                    else -> EasingType.SMOOTH
-                }
-                val mStr = kf.optString("motion", "NONE").uppercase()
-                val mType = when {
-                    mStr.contains("ZOOM_IN") -> MotionType.ZOOM_IN
-                    mStr.contains("ZOOM_OUT") -> MotionType.ZOOM_OUT
-                    mStr.contains("PAN_LEFT") -> MotionType.PAN_LEFT
-                    mStr.contains("PAN_RIGHT") -> MotionType.PAN_RIGHT
-                    mStr.contains("TILT") -> MotionType.TILT_UP
-                    mStr.contains("ROT") -> MotionType.ROTATION
-                    else -> MotionType.NONE
-                }
-                keyframesList.add(
-                    Keyframe(
-                        id = UUID.randomUUID().toString(),
-                        timestampMs = tMs,
-                        x = x,
-                        y = y,
-                        scale = scale,
-                        rotation = rot,
-                        easing = easing,
-                        motionType = mType,
-                        confidence = 0.93f
-                    )
+            eventsList.add(
+                DetectedEvent(
+                    id = UUID.randomUUID().toString(),
+                    startTimeMs = startMs,
+                    endTimeMs = endMs,
+                    type = mType,
+                    confidence = ev.optDouble("confidence", 0.90).toFloat(),
+                    description = ev.optString("description", "Camera motion"),
+                    intensity = ev.optDouble("intensity", 0.5).toFloat()
                 )
-            }
+            )
         }
 
-        // If AI returned empty keyframes, supply safe minimum points
-        if (keyframesList.isEmpty()) {
-            keyframesList.add(Keyframe(UUID.randomUUID().toString(), 0L, 0.5f, 0.5f, 1.0f, 0f, easing = EasingType.SMOOTH))
-            keyframesList.add(Keyframe(UUID.randomUUID().toString(), metadata.durationMs, 0.5f, 0.5f, 1.0f, 0f, easing = EasingType.SMOOTH))
-        }
-
-        return AiAnalysisResult(
-            isDemo = isDemo,
-            referenceDurationSec = metadata.durationMs / 1000f,
-            detectedFps = metadata.fps,
-            motionStyle = motionStyle,
-            events = eventsList,
-            rawKeyframes = keyframesList.sortedBy { it.timestampMs },
-            overallConfidence = overallConfidence,
-            sceneCutsCount = sceneCuts,
-            notes = if (isDemo) "DEMO ANALYSIS: Synthetic Keyframe Dataset" else "Analyzed via Multimodal AI"
-        )
+        Pair(eventsList, motionStyle)
     }
 
-    private suspend fun generateDemoAnalysisResult(
-        metadata: VideoMetadata,
+    /**
+     * Decodes frames from either sample or local user video URI at adaptive intervals
+     */
+    private suspend fun decodeReferenceFrames(
+        referenceMetadata: VideoMetadata,
         onProgress: (String, Float) -> Unit
-    ): AiAnalysisResult {
-        onProgress("Analyzing camera pan vectors & optical flow", 0.45f)
-        delay(250)
-        onProgress("Detecting acceleration curve key moments", 0.70f)
-        delay(250)
-        onProgress("Synthesizing normalized relative motion curve", 0.90f)
-        delay(200)
+    ): List<Pair<Long, Bitmap>> = withContext(Dispatchers.IO) {
+        val uri = Uri.parse(referenceMetadata.uri)
+        val durationMs = maxOf(1000L, referenceMetadata.durationMs)
+        val frames = mutableListOf<Pair<Long, Bitmap>>()
 
-        val duration = maxOf(3000L, metadata.durationMs)
-        val dSec = duration / 1000f
+        // Adaptive frame interval: sample every ~100ms for high temporal resolution (10 frames/sec)
+        val intervalMs = 100L
+        val frameCount = ((durationMs / intervalMs) + 1).toInt().coerceIn(10, 60)
 
-        // High quality realistic editing curve
-        val events = listOf(
-            DetectedEvent(
-                id = UUID.randomUUID().toString(),
-                startTimeMs = 0L,
-                endTimeMs = (duration * 0.28).toLong(),
-                type = MotionType.ZOOM_IN,
-                confidence = 0.96f,
-                description = "Dramatic push-in with rapid acceleration",
-                intensity = 1.35f
-            ),
-            DetectedEvent(
-                id = UUID.randomUUID().toString(),
-                startTimeMs = (duration * 0.28).toLong(),
-                endTimeMs = (duration * 0.62).toLong(),
-                type = MotionType.PAN_RIGHT,
-                confidence = 0.91f,
-                description = "Horizontal subject tracking pan with ease-out",
-                intensity = 1.15f
-            ),
-            DetectedEvent(
-                id = UUID.randomUUID().toString(),
-                startTimeMs = (duration * 0.62).toLong(),
-                endTimeMs = duration,
-                type = MotionType.COMBINED,
-                confidence = 0.89f,
-                description = "Cinematic rotation tilt with snap re-center",
-                intensity = 1.20f
-            )
-        )
+        if (SampleMediaHelper.isSampleUri(uri)) {
+            // Sample clip: generate synthesized frames with kinematic motion curves
+            for (i in 0 until frameCount) {
+                val tMs = (i * intervalMs).coerceAtMost(durationMs)
+                val bmp = SampleMediaHelper.generateSampleFrame(
+                    isReference = true,
+                    timeMs = tMs,
+                    width = 320,
+                    height = 180
+                )
+                frames.add(tMs to bmp)
+                val pct = 0.10f + (i.toFloat() / frameCount.toFloat()) * 0.25f
+                onProgress("Decoded reference frame ${i + 1}/$frameCount", pct)
+            }
+            return@withContext frames
+        }
 
-        val keyframes = listOf(
-            Keyframe(
-                id = UUID.randomUUID().toString(),
-                timestampMs = 0L,
-                x = 0.50f,
-                y = 0.50f,
-                scale = 1.00f,
-                rotation = 0.0f,
-                easing = EasingType.SMOOTH,
-                motionType = MotionType.NONE,
-                confidence = 0.98f
-            ),
-            Keyframe(
-                id = UUID.randomUUID().toString(),
-                timestampMs = (duration * 0.28).toLong(),
-                x = 0.46f,
-                y = 0.47f,
-                scale = 1.32f,
-                rotation = -1.8f,
-                easing = EasingType.EASE_OUT,
-                motionType = MotionType.ZOOM_IN,
-                confidence = 0.95f
-            ),
-            Keyframe(
-                id = UUID.randomUUID().toString(),
-                timestampMs = (duration * 0.55).toLong(),
-                x = 0.56f,
-                y = 0.51f,
-                scale = 1.28f,
-                rotation = 0.8f,
-                easing = EasingType.EASE_IN_OUT,
-                motionType = MotionType.PAN_RIGHT,
-                confidence = 0.92f
-            ),
-            Keyframe(
-                id = UUID.randomUUID().toString(),
-                timestampMs = (duration * 0.80).toLong(),
-                x = 0.52f,
-                y = 0.48f,
-                scale = 1.40f,
-                rotation = 2.2f,
-                easing = EasingType.CUBIC,
-                motionType = MotionType.COMBINED,
-                confidence = 0.90f
-            ),
-            Keyframe(
-                id = UUID.randomUUID().toString(),
-                timestampMs = duration,
-                x = 0.50f,
-                y = 0.50f,
-                scale = 1.05f,
-                rotation = 0.0f,
-                easing = EasingType.SMOOTH,
-                motionType = MotionType.ZOOM_OUT,
-                confidence = 0.94f
-            )
-        )
+        // Real User Video via MediaMetadataRetriever
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(context, uri)
 
-        return AiAnalysisResult(
-            isDemo = true,
-            referenceDurationSec = dSec,
-            detectedFps = metadata.fps,
-            motionStyle = "Cinematic Kinetic Tracking",
-            events = events,
-            rawKeyframes = keyframes,
-            overallConfidence = 0.93f,
-            sceneCutsCount = 2,
-            notes = "DEMO ANALYSIS: Synthetic Keyframe Dataset (Connect Gemini API Key in Settings for live cloud analysis)"
-        )
+            for (i in 0 until frameCount) {
+                val tMs = (i * intervalMs).coerceAtMost(durationMs)
+                val timeUs = tMs * 1000L
+
+                val bitmap = try {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
+                        retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, 320, 180)
+                    } else {
+                        retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    }
+                } catch (_: Exception) {
+                    null
+                }
+
+                if (bitmap != null) {
+                    frames.add(tMs to bitmap)
+                }
+
+                val pct = 0.10f + (i.toFloat() / frameCount.toFloat()) * 0.25f
+                onProgress("Decoded reference frame ${i + 1}/$frameCount", pct)
+            }
+        } finally {
+            try {
+                retriever.release()
+            } catch (_: Exception) {}
+        }
+
+        frames
     }
 }

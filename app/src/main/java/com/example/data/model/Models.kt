@@ -88,6 +88,30 @@ data class ExportConfig(
     val motionIntensityMultiplier: Float = 1.0f
 )
 
+data class MotionSample(
+    val timestampMs: Long,
+    val normalizedTime: Float, // 0.0 to 1.0
+    val scale: Float = 1.0f,
+    val translationX: Float = 0.0f, // Normalized offset from frame center (-1.0 to 1.0)
+    val translationY: Float = 0.0f, // Normalized offset from frame center (-1.0 to 1.0)
+    val rotationDegrees: Float = 0.0f,
+    val velocity: Float = 0.0f,
+    val acceleration: Float = 0.0f,
+    val confidence: Float = 1.0f
+)
+
+data class MotionTimeline(
+    val durationMs: Long,
+    val sourceFps: Float,
+    val samples: List<MotionSample>,
+    val analysisConfidence: Float = 0.95f,
+    val avgMotion: Float = 0.0f,
+    val maxZoom: Float = 1.0f,
+    val maxX: Float = 0.0f,
+    val maxY: Float = 0.0f,
+    val maxRotation: Float = 0.0f
+)
+
 data class AiAnalysisResult(
     val isDemo: Boolean = false,
     val referenceDurationSec: Float,
@@ -97,5 +121,13 @@ data class AiAnalysisResult(
     val rawKeyframes: List<Keyframe>,
     val overallConfidence: Float,
     val sceneCutsCount: Int,
-    val notes: String
+    val notes: String,
+    val motionTimeline: MotionTimeline? = null,
+    val avgMotion: Float = 0.0f,
+    val maxZoom: Float = 1.0f,
+    val maxX: Float = 0.0f,
+    val maxY: Float = 0.0f,
+    val maxRotation: Float = 0.0f,
+    val isSuccess: Boolean = true,
+    val errorMessage: String? = null
 )

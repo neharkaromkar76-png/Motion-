@@ -94,6 +94,7 @@ class VideoRenderEngine(private val context: Context) {
             val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
             onProgress("Rendering keyframe motion transformations", 0.15f)
+            android.util.Log.d("MotionMatchAI", "EXPORT_MOTION_APPLIED: totalFrames=$totalFrames, outWidth=$outWidth, outHeight=$outHeight, fps=$fps, keyframesCount=${keyframes.size}")
 
             for (frameIdx in 0 until totalFrames) {
                 if (isCancelled.get()) {
@@ -101,6 +102,10 @@ class VideoRenderEngine(private val context: Context) {
                 }
 
                 val frameTimeMs = (frameIdx.toFloat() / fps * 1000).toLong().coerceAtMost(durationMs)
+                if (frameIdx % maxOf(1, totalFrames / 6) == 0) {
+                    val tf = Interpolator.evaluateKeyframeAtTime(frameTimeMs, keyframes)
+                    android.util.Log.d("MotionMatchAI", "EXPORT_FRAME_SAMPLE[${frameTimeMs}ms]: scale=${tf.scale}, x=${tf.x}, y=${tf.y}, rot=${tf.rotation}")
+                }
                 val frameTimeUs = frameTimeMs * 1000L
 
                 // Extract source video frame

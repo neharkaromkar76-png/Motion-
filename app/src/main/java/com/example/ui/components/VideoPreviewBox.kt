@@ -7,7 +7,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -31,6 +30,7 @@ import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.ViewCarousel
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -38,6 +38,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -52,7 +53,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
@@ -67,13 +67,19 @@ import com.example.ui.theme.StudioAmber
 import com.example.ui.theme.StudioBorder
 import com.example.ui.theme.StudioCyan
 import com.example.ui.theme.StudioEmerald
+import com.example.ui.theme.StudioPrimary
+import com.example.ui.theme.StudioSurface
 import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.StudioSurfaceHighlight
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
+import com.example.ui.theme.StudioTextTertiary
 
-enum class PreviewMode {
-    EDITED, ORIGINAL, SPLIT
+enum class PreviewMode(val label: String) {
+    EDITED("MOTION"),
+    ORIGINAL("TARGET"),
+    REFERENCE("REFERENCE"),
+    SPLIT("SPLIT")
 }
 
 @Composable
@@ -87,7 +93,12 @@ fun VideoPreviewBox(
     onTogglePlay: () -> Unit,
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier,
-    aspectRatio: Float = 16f / 9f
+    aspectRatio: Float = 16f / 9f,
+    referenceFrameBitmap: Bitmap? = null,
+    onReplay: () -> Unit = {
+        onSeek(0L)
+        if (!isPlaying) onTogglePlay()
+    }
 ) {
     var previewMode by remember { mutableStateOf(PreviewMode.EDITED) }
     var showSubjectGuide by remember { mutableStateOf(false) }
@@ -97,11 +108,17 @@ fun VideoPreviewBox(
         Interpolator.evaluateKeyframeAtTime(currentTimeMs, keyframes)
     }
 
+    LaunchedEffect(keyframes.size) {
+        if (keyframes.isNotEmpty()) {
+            android.util.Log.d("MotionMatchAI", "PREVIEW_STARTED: keyframesCount=${keyframes.size}, currentTimeMs=$currentTimeMs")
+        }
+    }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(16.dp))
-            .background(Color(0xFF070A0F))
+            .background(StudioSurface)
             .border(1.dp, StudioBorder, RoundedCornerShape(16.dp))
     ) {
         // Top Toolbar: Mode Switcher & Guide toggle
@@ -125,19 +142,15 @@ fun VideoPreviewBox(
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(if (selected) StudioCyan else Color.Transparent)
+                            .background(if (selected) StudioPrimary else Color.Transparent)
                             .clickable { previewMode = mode }
-                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .padding(horizontal = 9.dp, vertical = 4.dp)
                             .testTag("preview_mode_${mode.name.lowercase()}"),
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = when (mode) {
-                                PreviewMode.EDITED -> "EDITED"
-                                PreviewMode.ORIGINAL -> "ORIGINAL"
-                                PreviewMode.SPLIT -> "SPLIT"
-                            },
-                            color = if (selected) Color.Black else StudioTextSecondary,
+                            text = mode.label,
+                            color = if (selected) Color.White else StudioTextSecondary,
                             fontSize = 11.sp,
                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                         )
@@ -151,40 +164,57 @@ fun VideoPreviewBox(
                 modifier = Modifier
                     .clip(RoundedCornerShape(8.dp))
                     .clickable { showSubjectGuide = !showSubjectGuide }
-                    .background(if (showSubjectGuide) StudioAmber.copy(alpha = 0.2f) else Color.Transparent)
+                    .background(if (showSubjectGuide) StudioAmber.copy(alpha = 0.15f) else Color.Transparent)
                     .padding(horizontal = 8.dp, vertical = 4.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.CenterFocusStrong,
                     contentDescription = "Subject Guide",
                     tint = if (showSubjectGuide) StudioAmber else StudioTextSecondary,
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(15.dp)
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
-                    text = "Subject Guide",
+                    text = "Guide",
                     color = if (showSubjectGuide) StudioAmber else StudioTextSecondary,
-                    fontSize = 11.sp
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
                 )
             }
         }
 
-        // Video Viewport
+        // Video Viewport (Dark display surface for video pixels)
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspectRatio.coerceIn(0.5f, 2.2f))
-                .background(Color.Black)
+                .background(Color(0xFF0F172A))
                 .clip(RoundedCornerShape(0.dp)),
             contentAlignment = Alignment.Center
         ) {
             val boxWidth = maxWidth
             val boxHeight = maxHeight
 
-            if (frameBitmap != null) {
-                when (previewMode) {
-                    PreviewMode.ORIGINAL -> {
-                        // Original Untransformed
+            when (previewMode) {
+                PreviewMode.REFERENCE -> {
+                    // Show Reference Video Frame
+                    if (referenceFrameBitmap != null) {
+                        Image(
+                            bitmap = referenceFrameBitmap.asImageBitmap(),
+                            contentDescription = "Reference Video Frame",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("Reference Frame Available", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                        }
+                    }
+                }
+
+                PreviewMode.ORIGINAL -> {
+                    // Original Untransformed Target Video
+                    if (frameBitmap != null) {
                         Image(
                             bitmap = frameBitmap.asImageBitmap(),
                             contentDescription = "Original Frame",
@@ -192,12 +222,14 @@ fun VideoPreviewBox(
                             modifier = Modifier.fillMaxSize()
                         )
                     }
-                    PreviewMode.EDITED -> {
-                        // Transformed with Keyframes
+                }
+
+                PreviewMode.EDITED -> {
+                    // Transformed with Keyframes matching VideoRenderEngine
+                    if (frameBitmap != null) {
                         val scale = currentTransform.scale
-                        // Normalize shift relative to viewport size
-                        val transX = (currentTransform.x - 0.5f) * boxWidth.value * scale * -0.5f
-                        val transY = (currentTransform.y - 0.5f) * boxHeight.value * scale * -0.5f
+                        val transX = -(currentTransform.x - 0.5f) * boxWidth.value * scale
+                        val transY = -(currentTransform.y - 0.5f) * boxHeight.value * scale
 
                         Image(
                             bitmap = frameBitmap.asImageBitmap(),
@@ -214,8 +246,11 @@ fun VideoPreviewBox(
                                 }
                         )
                     }
-                    PreviewMode.SPLIT -> {
-                        // Split view with interactive slider
+                }
+
+                PreviewMode.SPLIT -> {
+                    // Split view with interactive slider
+                    if (frameBitmap != null) {
                         Box(modifier = Modifier.fillMaxSize()) {
                             // Left side: original
                             Image(
@@ -227,8 +262,8 @@ fun VideoPreviewBox(
 
                             // Right side: edited
                             val scale = currentTransform.scale
-                            val transX = (currentTransform.x - 0.5f) * boxWidth.value * scale * -0.5f
-                            val transY = (currentTransform.y - 0.5f) * boxHeight.value * scale * -0.5f
+                            val transX = -(currentTransform.x - 0.5f) * boxWidth.value * scale
+                            val transY = -(currentTransform.y - 0.5f) * boxHeight.value * scale
 
                             Box(
                                 modifier = Modifier
@@ -260,18 +295,13 @@ fun VideoPreviewBox(
                                     .width(4.dp)
                                     .fillMaxHeight()
                                     .background(StudioCyan)
-                                    .pointerInput(Unit) {
-                                        detectDragGestures { change, dragAmount ->
-                                            change.consume()
-                                            splitFraction = (splitFraction + (dragAmount.x / boxWidth.toPx())).coerceIn(0.1f, 0.9f)
-                                        }
-                                    }
                             )
                         }
                     }
                 }
-            } else {
-                // Placeholder when video frame is loading/not loaded
+            }
+
+            if (frameBitmap == null && referenceFrameBitmap == null) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
@@ -280,13 +310,13 @@ fun VideoPreviewBox(
                     Icon(
                         imageVector = Icons.Default.ViewCarousel,
                         contentDescription = null,
-                        tint = StudioTextSecondary.copy(alpha = 0.4f),
-                        modifier = Modifier.size(48.dp)
+                        tint = Color.White.copy(alpha = 0.4f),
+                        modifier = Modifier.size(44.dp)
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Video Preview Viewport",
-                        color = StudioTextSecondary,
+                        text = "Video Viewport",
+                        color = Color.White.copy(alpha = 0.7f),
                         fontSize = 13.sp
                     )
                 }
@@ -302,15 +332,12 @@ fun VideoPreviewBox(
                     val sw = targetSubject.width * w
                     val sh = targetSubject.height * h
 
-                    // Draw bounding box
                     drawRect(
                         color = StudioAmber,
                         topLeft = Offset(cx - sw / 2, cy - sh / 2),
                         size = Size(sw, sh),
                         style = Stroke(width = 2.dp.toPx())
                     )
-
-                    // Draw center reticle
                     drawLine(
                         color = StudioAmber,
                         start = Offset(cx - 15f, cy),
@@ -331,7 +358,7 @@ fun VideoPreviewBox(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(6.dp))
+                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(6.dp))
                     .padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -350,31 +377,30 @@ fun VideoPreviewBox(
                     fontFamily = FontFamily.Monospace
                 )
                 Text(
-                    text = String.format("Pos: (%.2f, %.2f)", currentTransform.x, currentTransform.y),
-                    color = StudioTextSecondary,
+                    text = String.format("X: %.2f Y: %.2f", currentTransform.x, currentTransform.y),
+                    color = Color.White.copy(alpha = 0.8f),
                     fontSize = 10.sp,
                     fontFamily = FontFamily.Monospace
                 )
             }
         }
 
-        // Scrubber and Playback Controls
+        // Scrubber and Playback Controls (Part 15: Play, Pause, Seek, Replay)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(StudioSurfaceElevated)
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .background(StudioSurface)
+                .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
-            // Slider
             val maxDur = maxOf(1000L, totalDurationMs)
             Slider(
                 value = currentTimeMs.toFloat(),
                 onValueChange = { onSeek(it.toLong()) },
                 valueRange = 0f..maxDur.toFloat(),
                 colors = SliderDefaults.colors(
-                    thumbColor = StudioCyan,
-                    activeTrackColor = StudioCyan,
-                    inactiveTrackColor = Color(0xFF263248)
+                    thumbColor = StudioPrimary,
+                    activeTrackColor = StudioPrimary,
+                    inactiveTrackColor = StudioSurfaceHighlight
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -398,14 +424,26 @@ fun VideoPreviewBox(
                     fontWeight = FontWeight.SemiBold
                 )
 
-                // Controls: Rewind, Play/Pause, Fast Forward
+                // Controls: Replay, Rewind, Play/Pause, Fast Forward (Part 15)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     IconButton(
+                        onClick = onReplay,
+                        modifier = Modifier.size(34.dp).testTag("preview_replay_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Replay,
+                            contentDescription = "Replay",
+                            tint = StudioTextSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    IconButton(
                         onClick = { onSeek((currentTimeMs - 1000).coerceAtLeast(0L)) },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.FastRewind,
@@ -417,9 +455,9 @@ fun VideoPreviewBox(
 
                     Box(
                         modifier = Modifier
-                            .size(42.dp)
+                            .size(40.dp)
                             .clip(CircleShape)
-                            .background(StudioCyan)
+                            .background(StudioPrimary)
                             .clickable { onTogglePlay() }
                             .testTag("preview_play_pause_button"),
                         contentAlignment = Alignment.Center
@@ -427,14 +465,14 @@ fun VideoPreviewBox(
                         Icon(
                             imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                             contentDescription = if (isPlaying) "Pause" else "Play",
-                            tint = Color.Black,
-                            modifier = Modifier.size(26.dp)
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
                         )
                     }
 
                     IconButton(
                         onClick = { onSeek((currentTimeMs + 1000).coerceAtMost(maxDur)) },
-                        modifier = Modifier.size(36.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.FastForward,
@@ -445,13 +483,13 @@ fun VideoPreviewBox(
                     }
                 }
 
-                // Active keyframe counter
+                // Active keyframe indicator
                 val activeKf = keyframes.find { kotlin.math.abs(it.timestampMs - currentTimeMs) < 250 }
                 if (activeKf != null) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
-                            .background(StudioAmber.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
+                            .background(StudioAmber.copy(alpha = 0.15f), RoundedCornerShape(4.dp))
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
@@ -464,7 +502,7 @@ fun VideoPreviewBox(
                 } else {
                     Text(
                         text = "${keyframes.size} Keyframes",
-                        color = StudioTextSecondary,
+                        color = StudioTextTertiary,
                         fontSize = 11.sp
                     )
                 }

@@ -21,7 +21,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -33,16 +32,19 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.ui.theme.StudioAmber
+import com.example.ui.theme.StudioBorder
 import com.example.ui.theme.StudioCyan
 import com.example.ui.theme.StudioEmerald
+import com.example.ui.theme.StudioPrimary
+import com.example.ui.theme.StudioSurface
 import com.example.ui.theme.StudioSurfaceElevated
+import com.example.ui.theme.StudioSurfaceHighlight
 import com.example.ui.theme.StudioTextPrimary
 import com.example.ui.theme.StudioTextSecondary
 import com.example.ui.theme.StudioTextTertiary
 
 enum class StudioStage(val index: Int, val shortLabel: String, val fullLabel: String) {
-    HOME(0, "Home", "Projects & Home"),
+    HOME(0, "Home", "Home"),
     REFERENCE(1, "Reference", "Select Reference Video"),
     TARGET(2, "Target", "Select Target Video"),
     ANALYSIS(3, "AI Analyze", "Analyze Reference Motion"),
@@ -64,15 +66,17 @@ fun StageProgressStepper(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .background(StudioSurfaceElevated, RoundedCornerShape(12.dp))
-            .padding(vertical = 10.dp, horizontal = 12.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(StudioSurface)
+            .border(1.dp, StudioBorder, RoundedCornerShape(12.dp))
+            .padding(vertical = 8.dp, horizontal = 10.dp)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(scrollState),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             val workflowStages = StudioStage.values().filter { it != StudioStage.HOME }
             workflowStages.forEachIndexed { index, stage ->
@@ -82,17 +86,16 @@ fun StageProgressStepper(
 
                 val circleBg by animateColorAsState(
                     targetValue = when {
-                        isCurrent -> StudioCyan
+                        isCurrent -> StudioPrimary
                         isCompleted -> StudioEmerald
-                        else -> Color(0xFF1E2638)
+                        else -> StudioSurfaceHighlight
                     },
                     label = "circleBg"
                 )
 
                 val contentColor by animateColorAsState(
                     targetValue = when {
-                        isCurrent -> Color.Black
-                        isCompleted -> Color.Black
+                        isCurrent || isCompleted -> Color.White
                         else -> StudioTextTertiary
                     },
                     label = "contentColor"
@@ -103,12 +106,13 @@ fun StageProgressStepper(
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
                         .clickable(enabled = isUnlocked) { onStageSelected(stage) }
-                        .padding(horizontal = 6.dp, vertical = 4.dp)
-                        .testTag("stepper_stage_${stage.name.lowercase()}")
+                        .background(if (isCurrent) StudioSurfaceElevated else Color.Transparent)
+                        .padding(horizontal = 8.dp, vertical = 6.dp)
+                        .testTag("stepper_item_${stage.name.lowercase()}")
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(24.dp)
+                            .size(22.dp)
                             .clip(CircleShape)
                             .background(circleBg),
                         contentAlignment = Alignment.Center
@@ -117,12 +121,12 @@ fun StageProgressStepper(
                             Icon(
                                 imageVector = Icons.Default.Check,
                                 contentDescription = "Completed",
-                                tint = contentColor,
-                                modifier = Modifier.size(14.dp)
+                                tint = Color.White,
+                                modifier = Modifier.size(13.dp)
                             )
                         } else {
                             Text(
-                                text = (index + 1).toString(),
+                                text = "${stage.index}",
                                 color = contentColor,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
@@ -134,20 +138,19 @@ fun StageProgressStepper(
 
                     Text(
                         text = stage.shortLabel,
-                        color = if (isCurrent) StudioCyan else if (isCompleted) StudioTextPrimary else StudioTextSecondary,
                         fontSize = 12.sp,
-                        fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium
+                        fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                        color = if (isCurrent) StudioTextPrimary else if (isCompleted) StudioTextSecondary else StudioTextTertiary
                     )
+                }
 
-                    if (index < workflowStages.size - 1) {
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Box(
-                            modifier = Modifier
-                                .width(12.dp)
-                                .height(2.dp)
-                                .background(if (isCompleted) StudioEmerald.copy(alpha = 0.5f) else Color(0xFF263248))
-                        )
-                    }
+                if (index < workflowStages.size - 1) {
+                    Box(
+                        modifier = Modifier
+                            .width(10.dp)
+                            .height(1.dp)
+                            .background(if (isCompleted) StudioEmerald else StudioBorder)
+                    )
                 }
             }
         }

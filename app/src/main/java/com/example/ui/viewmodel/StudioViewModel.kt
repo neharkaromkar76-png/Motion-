@@ -244,9 +244,14 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
         _analysisStageMessage.value = "Analysis cancelled by user"
     }
 
-    fun runAiAnalysis() {
+    fun runAiAnalysis(forceReanalyze: Boolean = false) {
         val refMeta = _referenceMetadata.value ?: return
         val targetMeta = _targetMetadata.value ?: return
+
+        if (forceReanalyze) {
+            _aiResult.value = null
+            _targetKeyframes.value = emptyList()
+        }
 
         analysisJob?.cancel()
         analysisJob = viewModelScope.launch {
@@ -268,6 +273,12 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
 
                 _aiResult.value = analysis
 
+                if (!analysis.isSuccess) {
+                    _isAnalyzing.value = false
+                    _analysisStageMessage.value = analysis.errorMessage ?: "Reference motion could not be reliably analyzed."
+                    return@launch
+                }
+
                 _analysisStageMessage.value = "Adapting motion curves to target subject..."
                 _analysisProgress.value = 0.95f
                 delay(200)
@@ -279,7 +290,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                     targetMetadata = targetMeta,
                     targetSubject = subject,
                     timingMode = _timingMode.value,
-                    motionIntensity = _motionIntensity.value
+                    motionIntensity = _motionIntensity.value,
+                    timeline = analysis.motionTimeline
                 )
 
                 originalGeneratedKeyframes = transferredKeyframes
@@ -296,7 +308,7 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
                 _currentStage.value = StudioStage.PREVIEW
             } catch (e: Exception) {
                 _isAnalyzing.value = false
-                _analysisStageMessage.value = "Analysis stopped"
+                _analysisStageMessage.value = "Analysis error: ${e.message ?: "Analysis stopped"}"
             }
         }
     }
@@ -313,7 +325,8 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             targetMetadata = targetMeta,
             targetSubject = subject,
             timingMode = _timingMode.value,
-            motionIntensity = _motionIntensity.value
+            motionIntensity = _motionIntensity.value,
+            timeline = _aiResult.value?.motionTimeline
         )
         _targetKeyframes.value = updated
     }
@@ -478,6 +491,13 @@ class StudioViewModel(application: Application) : AndroidViewModel(application) 
             if (_targetKeyframes.value.isNotEmpty()) {
                 repository.saveKeyframes(newId, _targetKeyframes.value)
             }
+        }
+    }
+
+    fun loadProject(projectId: Long) {
+        viewModelScope.launch {
+            val proj = repository.getProjectById(projectId) ?: return@launch
+            loadProject(proj)
         }
     }
 
